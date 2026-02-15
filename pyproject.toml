@@ -18,6 +18,8 @@ dependencies = [
 [project.scripts]
 garmin-coach-auth = "garmin_coach_mcp.cli:cmd_auth"
 garmin-coach-sync = "garmin_coach_mcp.cli:cmd_sync"
+garmin-coach-summary = "garmin_coach_mcp.cli:cmd_summary"
+garmin-coach-query = "garmin_coach_mcp.cli:cmd_query"
 garmin-coach-mcp = "garmin_coach_mcp.cli:cmd_server"
 
 [tool.hatch.build.targets.wheel]
