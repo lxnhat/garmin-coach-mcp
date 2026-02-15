@@ -2,6 +2,7 @@
 
   garmin-coach-auth      — authenticate with Garmin Connect (saves tokens)
   garmin-coach-sync      — sync data from Garmin to local SQLite
+  garmin-coach-refresh   — sync latest + summarize (single process, smart cooldown)
   garmin-coach-summary   — print health + training summary (human-readable)
   garmin-coach-query     — run read-only SQL and print results
   garmin-coach-mcp       — start the MCP server (stdio)
@@ -13,6 +14,7 @@ import argparse
 import json
 import os
 import sys
+import time
 
 DEFAULT_DB = os.path.expanduser("~/.garminconnect/garmin_coach.db")
 DEFAULT_TOKEN_DIR = os.path.expanduser("~/.garminconnect")
@@ -97,14 +99,18 @@ def cmd_sync():
         print(f"\n{len(result['warnings'])} warning(s) — see details above.", file=sys.stderr)
 
 
-# ── garmin-coach-summary ──────────────────────────────────────────────────────
+# ── garmin-coach-refresh ─────────────────────────────────────────────────────
 
 
-def cmd_summary():
-    """Print a human-readable health + training summary."""
+def cmd_refresh():
+    """Sync latest Garmin data (with smart cooldown) then print summary.
+
+    Designed for on-demand user questions. Skips the API call if the DB
+    was updated within the cooldown window (default 5 minutes).
+    """
     parser = argparse.ArgumentParser(
-        prog="garmin-coach-summary",
-        description="Print a health and training summary from the local Garmin database.",
+        prog="garmin-coach-refresh",
+        description="Sync latest data then print summary (smart cooldown).",
     )
     parser.add_argument(
         "--days", type=int, default=7,
@@ -114,19 +120,62 @@ def cmd_summary():
         "--db", default=DEFAULT_DB,
         help=f"Path to SQLite database (default: {DEFAULT_DB})",
     )
+    parser.add_argument(
+        "--token-dir", default=DEFAULT_TOKEN_DIR,
+        help=f"Directory with saved tokens (default: {DEFAULT_TOKEN_DIR})",
+    )
+    parser.add_argument(
+        "--cooldown", type=int, default=5,
+        help="Skip sync if DB was updated within N minutes (default: 5)",
+    )
+    parser.add_argument(
+        "--force", action="store_true",
+        help="Bypass cooldown — always sync from Garmin",
+    )
     args = parser.parse_args()
 
-    if not os.path.exists(args.db):
-        print("Error: No Garmin database found. Run garmin-coach-sync first.", file=sys.stderr)
-        sys.exit(1)
+    # ── Smart cooldown: skip sync if DB is fresh ──
+    needs_sync = args.force
+    db_age_min = None
+    if not needs_sync:
+        try:
+            db_age_min = (time.time() - os.path.getmtime(args.db)) / 60
+            needs_sync = db_age_min > args.cooldown
+        except OSError:
+            needs_sync = True  # DB doesn't exist yet
 
-    os.environ["GARMIN_COACH_DB"] = args.db
+    if needs_sync:
+        from .auth import login_from_tokens
+        from .models import init_db
+        from .sync import sync_all
 
-    from .server import health_summary, training_overview, sync_status
+        try:
+            client = login_from_tokens(args.token_dir)
+        except RuntimeError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            print("Run garmin-coach-auth first.", file=sys.stderr)
+            sys.exit(1)
+
+        session = init_db(args.db)
+        print("Syncing latest data from Garmin Connect...", file=sys.stderr)
+        sync_all(client, session, days=1)
+        print("Sync complete.", file=sys.stderr)
+    else:
+        print(f"Using cached data (synced {int(db_age_min)}m ago).", file=sys.stderr)
+
+    # ── Print summary (same as cmd_summary) ──
+    _print_summary(args.db, args.days)
+
+
+def _print_summary(db_path: str, days: int):
+    """Shared summary printer used by cmd_summary and cmd_refresh."""
+    os.environ["GARMIN_COACH_DB"] = db_path
+
+    from .server import health_summary, training_overview
 
     # Health summary
-    hs = health_summary.fn(days=args.days)
-    print(f"=== Health Summary (last {args.days} days) ===\n")
+    hs = health_summary.fn(days=days)
+    print(f"=== Health Summary (last {days} days) ===\n")
 
     if hs["daily"]:
         print("Daily Stats:")
@@ -166,9 +215,9 @@ def cmd_summary():
         print()
 
     # Training overview
-    to = training_overview.fn(days=args.days)
+    to = training_overview.fn(days=days)
     if to["activities"]:
-        print(f"=== Training Overview (last {args.days} days) ===\n")
+        print(f"=== Training Overview (last {days} days) ===\n")
 
         if to["by_type"]:
             print("By type:")
@@ -207,6 +256,32 @@ def cmd_summary():
                 t = f"{h}:{m:02}:{s:02}" if h else f"{m}:{s:02}"
                 print(f"  {label}: {t}")
         print()
+
+
+# ── garmin-coach-summary ──────────────────────────────────────────────────────
+
+
+def cmd_summary():
+    """Print a human-readable health + training summary (local DB only, no sync)."""
+    parser = argparse.ArgumentParser(
+        prog="garmin-coach-summary",
+        description="Print a health and training summary from the local Garmin database.",
+    )
+    parser.add_argument(
+        "--days", type=int, default=7,
+        help="Number of days to summarize (default: 7)",
+    )
+    parser.add_argument(
+        "--db", default=DEFAULT_DB,
+        help=f"Path to SQLite database (default: {DEFAULT_DB})",
+    )
+    args = parser.parse_args()
+
+    if not os.path.exists(args.db):
+        print("Error: No Garmin database found. Run garmin-coach-sync first.", file=sys.stderr)
+        sys.exit(1)
+
+    _print_summary(args.db, args.days)
 
 
 # ── garmin-coach-query ────────────────────────────────────────────────────────
