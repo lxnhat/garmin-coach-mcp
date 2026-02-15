@@ -355,12 +355,17 @@ def _sync_training_status(
                 d = client.get_training_status(ds)
                 if not d:
                     continue
+                # VO2max is nested under mostRecentVO2Max.generic
+                vo2 = _g(d, "mostRecentVO2Max", "generic") or {}
+                # Training load is nested under mostRecentTrainingLoadBalance
+                load_map = _g(d, "mostRecentTrainingLoadBalance", "metricsTrainingLoadBalanceDTOMap") or {}
+                load_dto = next(iter(load_map.values()), {}) if load_map else {}
                 vals = dict(
                     status=_g(d, "trainingStatusPhrase") or _g(d, "trainingStatus"),
-                    load_7d=_g(d, "weeklyTrainingLoad") or _g(d, "loadShort"),
-                    load_28d=_g(d, "monthlyTrainingLoad") or _g(d, "loadLong"),
-                    vo2max=_g(d, "vo2Max") or _g(d, "vo2MaxPreciseValue"),
-                    fitness_age=_g(d, "fitnessAge"),
+                    load_7d=_g(load_dto, "weeklyTrainingLoad") or _g(load_dto, "monthlyLoadAerobicLow"),
+                    load_28d=_g(load_dto, "monthlyLoadAerobicHigh"),
+                    vo2max=_g(vo2, "vo2MaxPreciseValue") or _g(vo2, "vo2MaxValue"),
+                    fitness_age=_g(vo2, "fitnessAge") or _g(d, "fitnessAge"),
                     raw_json=json.dumps(d),
                 )
                 _upsert(session, TrainingStatus, {"date": ds}, vals)
@@ -428,13 +433,13 @@ def _sync_race_predictions(
     try:
         d = client.get_race_predictions()
         if d:
-            ds = datetime.now().strftime("%Y-%m-%d")
             preds = d if isinstance(d, dict) else {}
+            ds = _g(preds, "calendarDate") or datetime.now().strftime("%Y-%m-%d")
             vals = dict(
-                five_k_sec=_to_sec(_g(preds, "5k", "time") or _g(preds, "racePredictions", "5k")),
-                ten_k_sec=_to_sec(_g(preds, "10k", "time") or _g(preds, "racePredictions", "10k")),
-                half_marathon_sec=_to_sec(_g(preds, "half", "time") or _g(preds, "racePredictions", "halfMarathon")),
-                marathon_sec=_to_sec(_g(preds, "marathon", "time") or _g(preds, "racePredictions", "marathon")),
+                five_k_sec=_to_sec(_g(preds, "time5K") or _g(preds, "5k", "time")),
+                ten_k_sec=_to_sec(_g(preds, "time10K") or _g(preds, "10k", "time")),
+                half_marathon_sec=_to_sec(_g(preds, "timeHalfMarathon") or _g(preds, "half", "time")),
+                marathon_sec=_to_sec(_g(preds, "timeMarathon") or _g(preds, "marathon", "time")),
                 raw_json=json.dumps(d),
             )
             _upsert(session, RacePrediction, {"date": ds}, vals)
@@ -472,17 +477,20 @@ def _sync_personal_records(
         if d:
             records = d if isinstance(d, list) else _g(d, "personalRecords") or []
             for rec in records:
-                rtype = _g(rec, "typeKey") or _g(rec, "personalRecordType") or ""
+                rid = str(_g(rec, "id") or "")
+                if not rid:
+                    continue
+                type_id = _g(rec, "typeId")
                 atype = _g(rec, "activityType") or ""
-                rid = f"{rtype}_{atype}" if atype else rtype
-                ds = _g(rec, "prDate") or _g(rec, "createdDate") or ""
+                # Extract date from formatted GMT string
+                ds = _g(rec, "actStartDateTimeInGMTFormatted") or ""
                 if ds and "T" in ds:
                     ds = ds[:10]
                 vals = dict(
-                    type=rtype,
+                    type=str(type_id) if type_id is not None else "",
                     activity_type=atype,
-                    value=_g(rec, "value") or _g(rec, "prValue"),
-                    value_display=_g(rec, "displayValue") or _g(rec, "prDisplayValue") or "",
+                    value=_g(rec, "value"),
+                    value_display=_g(rec, "activityName") or "",
                     date=ds,
                     activity_id=str(_g(rec, "activityId") or ""),
                     raw_json=json.dumps(rec),
@@ -502,6 +510,11 @@ def _sync_personal_records(
 def _sync_activity_hr_zones(
     client: Garmin, session: Session, activity_ids: list[str]
 ) -> tuple[int, str | None]:
+    """Fetch HR zone breakdowns per activity.
+
+    Note: the /hrTimeInZones endpoint returns 403 for many accounts.
+    This function tries it but gracefully returns 0 if unavailable.
+    """
     count = 0
     errors: list[str] = []
     for aid in activity_ids:
@@ -510,45 +523,61 @@ def _sync_activity_hr_zones(
             if not d:
                 continue
             zones = d if isinstance(d, list) else _g(d, "hrTimeInZones") or []
+            # Garmin only gives zoneLowBoundary — compute max from next zone
             for i, z in enumerate(zones):
                 zn = _g(z, "zoneNumber", default=i + 1)
+                min_hr = _g(z, "zoneLowBoundary") or _g(z, "startBpm")
+                # Max HR = next zone's low boundary - 1 (last zone has no upper)
+                if i + 1 < len(zones):
+                    max_hr = (_g(zones[i + 1], "zoneLowBoundary") or 0) - 1
+                else:
+                    max_hr = None
                 vals = dict(
                     zone_name=f"Zone {zn}",
-                    min_hr=_g(z, "zoneLowBoundary") or _g(z, "startBpm"),
-                    max_hr=_g(z, "zoneHighBoundary") or _g(z, "endBpm"),
+                    min_hr=min_hr,
+                    max_hr=max_hr if max_hr and max_hr > 0 else None,
                     duration_sec=_g(z, "secsInZone") or _g(z, "duration"),
                     raw_json=json.dumps(z),
                 )
                 _upsert(session, ActivityHRZone, {"activity_id": str(aid), "zone": zn}, vals)
                 count += 1
             session.commit()
-        except Exception as e:
+        except Exception:
             session.rollback()
-            errors.append(f"hr_zones({aid}): {e}")
-    return count, "; ".join(errors) if errors else None
+            # 403 is common — don't accumulate per-activity errors
+            pass
+    return count, None
 
 
 def _sync_activity_splits(
     client: Garmin, session: Session, activity_ids: list[str]
 ) -> tuple[int, str | None]:
+    """Fetch splits from get_activity().splitSummaries (the /splits endpoint is 403)."""
     count = 0
     errors: list[str] = []
     for aid in activity_ids:
         try:
-            d = client.get_activity_splits(aid)
+            d = client.get_activity(aid)
             if not d:
                 continue
-            splits = d if isinstance(d, list) else _g(d, "lapDTOs") or _g(d, "activityDetailMetrics") or []
+            splits = _g(d, "splitSummaries") or []
             for i, sp in enumerate(splits):
                 dist_m = _g(sp, "distance", default=0) or 0
                 dur_s = _g(sp, "duration", default=0) or 0
-                sn = _g(sp, "lapIndex", default=i + 1)
+                sn = i + 1
+                # Convert averageSpeed (m/s) to pace (min/km)
+                avg_speed = _g(sp, "averageSpeed")
+                pace_str = None
+                if avg_speed and avg_speed > 0:
+                    pace_s_per_km = 1000 / avg_speed
+                    pm, ps = divmod(int(pace_s_per_km), 60)
+                    pace_str = f"{pm}:{ps:02d}"
                 vals = dict(
                     distance_km=round(dist_m / 1000, 3) if dist_m else None,
                     duration_sec=round(dur_s, 1),
                     avg_hr=_g(sp, "averageHR"),
                     max_hr=_g(sp, "maxHR"),
-                    avg_pace=_g(sp, "averageSpeed"),
+                    avg_pace=pace_str,
                     elevation_gain_m=_g(sp, "elevationGain"),
                     elevation_loss_m=_g(sp, "elevationLoss"),
                     calories=_g(sp, "calories"),

@@ -38,6 +38,9 @@ def login_interactive(
 
     client = Garmin(email=email, password=password, is_cn=False, prompt_mfa=_prompt_mfa)
     client.login()
+    # Use UUID displayName for API URLs (see _try_resume comment)
+    profile = client.garth.profile or {}
+    client.display_name = profile.get("displayName") or client.get_full_name()
     client.garth.dump(token_dir)
     print(f"Tokens saved to {token_dir}")
     return client
@@ -64,8 +67,10 @@ def _try_resume(token_dir: str) -> Garmin | None:
     try:
         client = Garmin()
         client.login(token_dir)
-        # Quick validation – fetch display name
-        client.display_name = client.get_full_name()
+        # Use the UUID displayName (not fullName) — Garmin's API requires
+        # the UUID in URL paths; fullName with spaces causes 403 errors.
+        profile = client.garth.profile or {}
+        client.display_name = profile.get("displayName") or client.get_full_name()
         return client
     except Exception:
         return None
